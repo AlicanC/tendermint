@@ -4,5 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bincode = { version = "2.0.1", features = ["serde"] }
 flume = { version = "0.11.1", features = ["async"] }
+libp2p = { version = "0.55.0", features = [
+  "tokio",
+  "gossipsub",
+  "mdns",
+  "noise",
+  "macros",
+  "tcp",
+  "yamux",
+  "quic",
+] }
+serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.43.0", features = ["full"] }

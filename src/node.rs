@@ -1,10 +1,26 @@
 #![allow(clippy::match_like_matches_macro)]
 #![allow(clippy::collapsible_if)]
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    hash::{DefaultHasher, Hash, Hasher},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
+use libp2p::{
+    PeerId, Swarm, SwarmBuilder,
+    futures::{FutureExt, StreamExt},
+    gossipsub,
+    identity::Keypair,
+    mdns, noise,
+    swarm::{self, NetworkBehaviour, SwarmEvent},
+    tcp, yamux,
+};
 use tokio::{
-    select,
+    io, select,
     sync::{Mutex, broadcast},
     task,
     time::{self, sleep},
@@ -19,7 +35,7 @@ pub enum Step {
     Precommit,
 }
 
-pub type NodeId = &'static str;
+pub type NodeId = String;
 pub type Height = u64;
 
 #[derive(Debug, Clone)]
@@ -59,12 +75,18 @@ impl NodeState {
 
 pub struct Node {
     id: NodeId,
+    keypair: Keypair,
     validator_set: ValidatorSet,
-    message_tx: broadcast::Sender<Message>,
+
     pub call_tx: flume::Sender<NodeCall>,
     call_rx: flume::Receiver<NodeCall>,
     pub event_tx: broadcast::Sender<NodeEvent>,
     pub event_rx: broadcast::Receiver<NodeEvent>,
+    publish_tx: flume::Sender<Message>,
+    publish_rx: flume::Receiver<Message>,
+
+    topic: gossipsub::IdentTopic,
+    swarm: Mutex<Swarm<SwarmBehaviour>>,
 
     pub state: Mutex<NodeState>,
 }
@@ -72,27 +94,70 @@ pub struct Node {
 impl Node {
     pub fn new(
         id: NodeId,
+        keypair: Keypair,
         validator_set: ValidatorSet,
-        message_tx: broadcast::Sender<Message>,
-    ) -> Self {
+    ) -> Result<Self, Box<dyn Error>> {
         let (call_tx, call_rx) = flume::bounded(16);
         let (event_tx, event_rx) = broadcast::channel(16);
-        Node {
+        let (publish_tx, publish_rx) = flume::bounded(16);
+
+        let topic = gossipsub::IdentTopic::new("consensus");
+        let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_quic()
+            .with_behaviour(|key| {
+                let message_id_fn = |message: &gossipsub::Message| {
+                    let mut s = DefaultHasher::new();
+                    message.data.hash(&mut s);
+                    gossipsub::MessageId::from(s.finish().to_string())
+                };
+
+                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                    .heartbeat_interval(Duration::from_secs(10))
+                    .validation_mode(gossipsub::ValidationMode::Strict)
+                    .message_id_fn(message_id_fn)
+                    .build()
+                    .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?;
+
+                let gossipsub = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossipsub_config,
+                )?;
+
+                let mdns = mdns::tokio::Behaviour::new(
+                    mdns::Config::default(),
+                    key.public().to_peer_id(),
+                )?;
+                Ok(SwarmBehaviour { gossipsub, mdns })
+            })?
+            .build();
+
+        Ok(Node {
             id,
+            keypair,
             validator_set,
-            message_tx,
             call_tx,
             call_rx,
             event_tx,
             event_rx,
+            publish_tx,
+            publish_rx,
+            topic,
+            swarm: Mutex::new(swarm),
             state: Mutex::new(NodeState::new()),
-        }
+        })
     }
 
-    fn proposer(&self, height: u64, round: u64) -> &'static str {
+    fn proposer(&self, height: u64, round: u64) -> String {
         self.validator_set.items
             [(height as usize + round as usize) % self.validator_set.items.len()]
         .0
+        .clone()
     }
 
     fn get_value(&self) -> Proposal {
@@ -121,6 +186,9 @@ impl Node {
             "{}: starting round {} at height {}",
             self.id, round, state.height,
         );
+        self.event_tx
+            .send(NodeEvent::StartingRound(state.height, state.round))
+            .unwrap();
         state.round = round;
         state.step = Step::Propose;
         if self.id == self.proposer(state.height, round) {
@@ -129,11 +197,14 @@ impl Node {
             } else {
                 self.get_value()
             };
+            let height = state.height;
+            let valid_round = state.valid_round;
+            drop(state);
             self.broadcast(MessageContent::Proposal {
-                height: state.height,
+                height,
                 round,
                 proposal,
-                valid_round: state.valid_round,
+                valid_round,
             })
             .await;
         } else {
@@ -147,7 +218,7 @@ impl Node {
         }
     }
 
-    async fn on_timeout_propose(&self, height: u64, round: u64) {
+    async fn on_timeout_propose(self: Arc<Self>, height: u64, round: u64) {
         let mut state = self.state.lock().await;
         if height == state.height && round == state.round && state.step == Step::Propose {
             println!("{}: timeout propose", self.id);
@@ -161,7 +232,7 @@ impl Node {
         }
     }
 
-    async fn on_timeout_prevote(&self, height: u64, round: u64) {
+    async fn on_timeout_prevote(self: Arc<Self>, height: u64, round: u64) {
         let mut state = self.state.lock().await;
         if height == state.height && round == state.round && state.step == Step::Prevote {
             println!("{}: timeout prevote", self.id);
@@ -184,13 +255,15 @@ impl Node {
         }
     }
 
-    async fn broadcast(&self, message_content: MessageContent) {
+    async fn broadcast(self: &Arc<Self>, message_content: MessageContent) {
         let message = Message {
-            sender: self.id,
+            sender: self.id.clone(),
             content: message_content,
         };
         println!("{}: broadcasting: {:?}", self.id, message.content);
-        self.message_tx.send(message).unwrap();
+        self.publish_tx.send(message.clone()).unwrap();
+        let mut state = self.state.lock().await;
+        state.message_log.push(message);
     }
 
     async fn handle_message(self: &Arc<Self>, message: Message) {
@@ -297,7 +370,7 @@ impl Node {
                 .message_log
                 .iter()
                 .filter(|m| m.content.height() == state.height && m.content.round() == state.round)
-                .map(|m| self.validator_set.power_of(m.sender))
+                .map(|m| self.validator_set.power_of(&m.sender))
                 .sum::<u64>()
                 > 2 * f + 1
             {
@@ -342,7 +415,7 @@ impl Node {
                                 proposal: Some(proposal.id),
                             }
                     })
-                    .map(|m| self.validator_set.power_of(m.sender))
+                    .map(|m| self.validator_set.power_of(&m.sender))
                     .sum::<u64>()
                     > 2 * f + 1
                     && self.valid(proposal)
@@ -385,7 +458,7 @@ impl Node {
                             proposal: None,
                         }
                 })
-                .map(|m| self.validator_set.power_of(m.sender))
+                .map(|m| self.validator_set.power_of(&m.sender))
                 .sum::<u64>()
                 > 2 * f + 1
             {
@@ -409,7 +482,7 @@ impl Node {
                 .message_log
                 .iter()
                 .filter(|m| m.content.height() == state.height && m.content.round() == state.round)
-                .map(|m| self.validator_set.power_of(m.sender))
+                .map(|m| self.validator_set.power_of(&m.sender))
                 .sum::<u64>()
                 > 2 * f + 1
             {
@@ -456,7 +529,7 @@ impl Node {
                                     proposal: Some(proposal.id),
                                 }
                         })
-                        .map(|m| self.validator_set.power_of(m.sender))
+                        .map(|m| self.validator_set.power_of(&m.sender))
                         .sum::<u64>()
                         > 2 * f + 1
                     {
@@ -488,7 +561,7 @@ impl Node {
                 .message_log
                 .iter()
                 .filter(|m| m.content.height() == state.height)
-                .map(|m| self.validator_set.power_of(m.sender))
+                .map(|m| self.validator_set.power_of(&m.sender))
                 .sum::<u64>()
                 > f + 1
             && message.content.round() > state.round
@@ -498,25 +571,20 @@ impl Node {
         }
     }
 
-    pub async fn run(self: Arc<Self>) {
+    pub async fn run(self: Arc<Self>) -> Result<(), Box<dyn Error>> {
         println!("{}: running...", self.id);
 
-        let mut message_rx = self.message_tx.subscribe();
+        let mut swarm = self.swarm.lock().await;
+
+        swarm.behaviour_mut().gossipsub.subscribe(&self.topic)?;
+
+        swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
         self.event_tx.send(NodeEvent::Ready).unwrap();
 
         loop {
             select! {
-                Ok(message) = message_rx.recv() => {
-                    let mut state = self.state.lock().await;
-                    state.message_log.push(message.clone());
-                    drop(state);
-                    if message.sender != self.id {
-                        println!("{}: received message from {}: {:?}", self.id, message.sender, message.content);
-                    }
-                    self.handle_message(message).await;
-                    sleep(Duration::from_millis(0)).await;
-                }
                 Ok(call) = self.call_rx.recv_async() => {
                     match call {
                         NodeCall::Start => {
@@ -525,18 +593,68 @@ impl Node {
                         }
                         NodeCall::Stop => {
                             println!("{}: stopping...", self.id);
-                            break;
+                            break Ok(());
                         }
                     }
                 }
+                Ok(message) = self.publish_rx.recv_async() => {
+                    let encoded_message =
+                        bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+                    swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(self.topic.clone(), encoded_message)
+                        .unwrap();
+                }
+                event = swarm.select_next_some() => match event {
+                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                        for (peer_id, _multiaddr) in list {
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            self.event_tx.send(NodeEvent::Discovered(peer_id)).unwrap();
+                        }
+                    },
+                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                        for (peer_id, _multiaddr) in list {
+                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        }
+                    },
+                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                        self.event_tx.send(NodeEvent::Subscribed).unwrap();
+                    },
+                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                        message,
+                        ..
+                    })) => {
+                        let peer_id = message.source.unwrap();
+                        let message: Message = bincode::serde::decode_from_slice(&message.data, bincode::config::standard()).unwrap().0;
+                        let mut state = self.state.lock().await;
+                        state.message_log.push(message.clone());
+                        drop(state);
+                        if message.sender != self.id {
+                            println!("{}: received message from {} ({}): {:?}", self.id, message.sender, peer_id, message.content);
+                        }
+                        self.handle_message(message).await;
+                        sleep(Duration::from_millis(0)).await;
+                    },
+                    _ => {}
+                },
             }
         }
     }
 }
 
+#[derive(NetworkBehaviour)]
+struct SwarmBehaviour {
+    gossipsub: gossipsub::Behaviour,
+    mdns: mdns::tokio::Behaviour,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeEvent {
     Ready,
+    Discovered(PeerId),
+    Subscribed,
+    StartingRound(Height, u64),
 }
 
 #[derive(Debug)]
@@ -559,10 +677,10 @@ impl ValidatorSet {
         self.items.iter().map(|(_, power)| *power).sum()
     }
 
-    pub fn power_of(&self, id: NodeId) -> u64 {
+    pub fn power_of(&self, id: &NodeId) -> u64 {
         self.items
             .iter()
-            .find(|(node_id, _)| *node_id == id)
+            .find(|(node_id, _)| node_id == id)
             .map(|(_, power)| *power)
             .unwrap_or(0)
     }
@@ -578,7 +696,11 @@ mod tests {
 
     #[tokio::test]
     async fn validator_set() {
-        let validator_set = ValidatorSet::new(vec![("Alice", 100), ("Bob", 100), ("Charlie", 100)]);
+        let validator_set = ValidatorSet::new(vec![
+            ("Alice".to_string(), 100),
+            ("Bob".to_string(), 100),
+            ("Charlie".to_string(), 100),
+        ]);
 
         let n = validator_set.total_power();
         assert_eq!(n, 300);

@@ -1,17 +1,19 @@
+use serde::{Deserialize, Serialize};
+
 pub type ProposalId = u64;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proposal {
     pub id: ProposalId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
-    pub sender: &'static str,
+    pub sender: String,
     pub content: MessageContent,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageContent {
     Proposal {
         height: u64,
