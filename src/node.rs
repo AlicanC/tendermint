@@ -5,18 +5,17 @@ use std::{
     collections::HashMap,
     error::Error,
     hash::{DefaultHasher, Hash, Hasher},
-    pin::Pin,
     sync::Arc,
     time::Duration,
 };
 
 use libp2p::{
     PeerId, Swarm, SwarmBuilder,
-    futures::{FutureExt, StreamExt},
+    futures::StreamExt,
     gossipsub,
     identity::Keypair,
     mdns, noise,
-    swarm::{self, NetworkBehaviour, SwarmEvent},
+    swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
 use tokio::{
@@ -26,7 +25,10 @@ use tokio::{
     time::{self, sleep},
 };
 
-use crate::message::{Message, MessageContent, Proposal};
+use crate::{
+    genesis::Genesis,
+    message::{Message, MessageContent, Proposal},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
@@ -92,11 +94,15 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(
-        id: NodeId,
-        keypair: Keypair,
-        validator_set: ValidatorSet,
-    ) -> Result<Self, Box<dyn Error>> {
+    pub fn new(id: NodeId, keypair: Keypair, genesis: Genesis) -> Result<Self, Box<dyn Error>> {
+        let validator_set = ValidatorSet::new(
+            genesis
+                .validators
+                .iter()
+                .map(|v| (v.public_key.to_peer_id(), v.voting_power))
+                .collect(),
+        );
+
         let (call_tx, call_rx) = flume::bounded(16);
         let (event_tx, event_rx) = broadcast::channel(16);
         let (publish_tx, publish_rx) = flume::bounded(16);
@@ -153,11 +159,10 @@ impl Node {
         })
     }
 
-    fn proposer(&self, height: u64, round: u64) -> String {
+    fn proposer(&self, height: u64, round: u64) -> PeerId {
         self.validator_set.items
             [(height as usize + round as usize) % self.validator_set.items.len()]
         .0
-        .clone()
     }
 
     fn get_value(&self) -> Proposal {
@@ -191,7 +196,7 @@ impl Node {
             .unwrap();
         state.round = round;
         state.step = Step::Propose;
-        if self.id == self.proposer(state.height, round) {
+        if self.keypair.public().to_peer_id() == self.proposer(state.height, round) {
             let proposal = if let Some(value) = state.valid_value.clone() {
                 value
             } else {
@@ -257,7 +262,7 @@ impl Node {
 
     async fn broadcast(self: &Arc<Self>, message_content: MessageContent) {
         let message = Message {
-            sender: self.id.clone(),
+            sender: self.keypair.public().to_peer_id(),
             content: message_content,
         };
         println!("{}: broadcasting: {:?}", self.id, message.content);
@@ -618,7 +623,7 @@ impl Node {
                             swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                         }
                     },
-                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { .. })) => {
                         self.event_tx.send(NodeEvent::Subscribed).unwrap();
                     },
                     SwarmEvent::Behaviour(SwarmBehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -630,7 +635,7 @@ impl Node {
                         let mut state = self.state.lock().await;
                         state.message_log.push(message.clone());
                         drop(state);
-                        if message.sender != self.id {
+                        if message.sender != self.keypair.public().to_peer_id() {
                             println!("{}: received message from {} ({}): {:?}", self.id, message.sender, peer_id, message.content);
                         }
                         self.handle_message(message).await;
@@ -665,11 +670,11 @@ pub enum NodeCall {
 
 #[derive(Clone, Debug)]
 pub struct ValidatorSet {
-    items: Vec<(NodeId, u64)>,
+    items: Vec<(PeerId, u64)>,
 }
 
 impl ValidatorSet {
-    pub fn new(items: Vec<(NodeId, u64)>) -> ValidatorSet {
+    pub fn new(items: Vec<(PeerId, u64)>) -> ValidatorSet {
         ValidatorSet { items }
     }
 
@@ -677,7 +682,7 @@ impl ValidatorSet {
         self.items.iter().map(|(_, power)| *power).sum()
     }
 
-    pub fn power_of(&self, id: &NodeId) -> u64 {
+    pub fn power_of(&self, id: &PeerId) -> u64 {
         self.items
             .iter()
             .find(|(node_id, _)| node_id == id)
@@ -696,10 +701,14 @@ mod tests {
 
     #[tokio::test]
     async fn validator_set() {
+        let alice = Keypair::generate_ed25519();
+        let bob = Keypair::generate_ed25519();
+        let charlie = Keypair::generate_ed25519();
+
         let validator_set = ValidatorSet::new(vec![
-            ("Alice".to_string(), 100),
-            ("Bob".to_string(), 100),
-            ("Charlie".to_string(), 100),
+            (alice.public().to_peer_id(), 100),
+            (bob.public().to_peer_id(), 100),
+            (charlie.public().to_peer_id(), 100),
         ]);
 
         let n = validator_set.total_power();

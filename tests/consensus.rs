@@ -1,6 +1,9 @@
 use libp2p::{PeerId, identity::Keypair};
 use std::{error::Error, sync::Arc};
-use tendermint::node::{Node, NodeCall, NodeEvent, ValidatorSet};
+use tendermint::{
+    genesis::{Genesis, Validator},
+    node::{Node, NodeCall, NodeEvent},
+};
 use tokio::task;
 
 #[derive(Clone)]
@@ -32,27 +35,29 @@ async fn consensus() -> Result<(), Box<dyn Error>> {
     let bob = TestActor::new("Bob    ")?;
     let charlie = TestActor::new("Charlie")?;
 
-    let validator_set = ValidatorSet::new(vec![
-        (alice.id.clone(), 100),
-        (bob.id.clone(), 100),
-        (charlie.id.clone(), 100),
-    ]);
+    let genesis = Genesis {
+        validators: vec![
+            Validator::new(alice.keypair.public().clone(), 100),
+            Validator::new(bob.keypair.public().clone(), 100),
+            Validator::new(charlie.keypair.public().clone(), 100),
+        ],
+    };
 
     // Create nodes
     let alice_node = Arc::new(Node::new(
         alice.id.clone(),
         alice.keypair.clone(),
-        validator_set.clone(),
+        genesis.clone(),
     )?);
     let bob_node = Arc::new(Node::new(
         bob.id.clone(),
         bob.keypair.clone(),
-        validator_set.clone(),
+        genesis.clone(),
     )?);
     let charlie_node = Arc::new(Node::new(
         charlie.id.clone(),
         charlie.keypair.clone(),
-        validator_set.clone(),
+        genesis.clone(),
     )?);
 
     let alice_call_tx = alice_node.call_tx.clone();
