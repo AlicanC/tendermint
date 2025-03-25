@@ -1,5 +1,6 @@
-use libp2p::{PeerId, identity::Keypair};
 use std::{error::Error, sync::Arc};
+
+use libp2p::{PeerId, identity::Keypair};
 use tendermint::{
     genesis::{Genesis, Validator},
     node::{Node, NodeCall, NodeEvent},

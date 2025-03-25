@@ -1,25 +1,11 @@
 #![allow(clippy::match_like_matches_macro)]
 #![allow(clippy::collapsible_if)]
 
-use std::{
-    collections::HashMap,
-    error::Error,
-    hash::{DefaultHasher, Hash, Hasher},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
-use libp2p::{
-    PeerId, Swarm, SwarmBuilder,
-    futures::StreamExt,
-    gossipsub,
-    identity::Keypair,
-    mdns, noise,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
-};
+use libp2p::{PeerId, identity::Keypair};
 use tokio::{
-    io, select,
+    select,
     sync::{Mutex, broadcast},
     task,
     time::{self, sleep},
@@ -28,6 +14,7 @@ use tokio::{
 use crate::{
     genesis::Genesis,
     message::{Message, MessageContent, Proposal},
+    p2p::{P2p, P2pCall, P2pEvent},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,8 +74,7 @@ pub struct Node {
     publish_tx: flume::Sender<Message>,
     publish_rx: flume::Receiver<Message>,
 
-    topic: gossipsub::IdentTopic,
-    swarm: Mutex<Swarm<SwarmBehaviour>>,
+    p2p: Mutex<P2p>,
 
     pub state: Mutex<NodeState>,
 }
@@ -107,41 +93,7 @@ impl Node {
         let (event_tx, event_rx) = broadcast::channel(16);
         let (publish_tx, publish_rx) = flume::bounded(16);
 
-        let topic = gossipsub::IdentTopic::new("consensus");
-        let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
-            .with_tokio()
-            .with_tcp(
-                tcp::Config::default(),
-                noise::Config::new,
-                yamux::Config::default,
-            )?
-            .with_quic()
-            .with_behaviour(|key| {
-                let message_id_fn = |message: &gossipsub::Message| {
-                    let mut s = DefaultHasher::new();
-                    message.data.hash(&mut s);
-                    gossipsub::MessageId::from(s.finish().to_string())
-                };
-
-                let gossipsub_config = gossipsub::ConfigBuilder::default()
-                    .heartbeat_interval(Duration::from_secs(10))
-                    .validation_mode(gossipsub::ValidationMode::Strict)
-                    .message_id_fn(message_id_fn)
-                    .build()
-                    .map_err(|msg| io::Error::new(io::ErrorKind::Other, msg))?;
-
-                let gossipsub = gossipsub::Behaviour::new(
-                    gossipsub::MessageAuthenticity::Signed(key.clone()),
-                    gossipsub_config,
-                )?;
-
-                let mdns = mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
-                    key.public().to_peer_id(),
-                )?;
-                Ok(SwarmBehaviour { gossipsub, mdns })
-            })?
-            .build();
+        let p2p = P2p::new(&keypair)?;
 
         Ok(Node {
             id,
@@ -153,8 +105,7 @@ impl Node {
             event_rx,
             publish_tx,
             publish_rx,
-            topic,
-            swarm: Mutex::new(swarm),
+            p2p: Mutex::new(p2p),
             state: Mutex::new(NodeState::new()),
         })
     }
@@ -579,12 +530,15 @@ impl Node {
     pub async fn run(self: Arc<Self>) -> Result<(), Box<dyn Error>> {
         println!("{}: running...", self.id);
 
-        let mut swarm = self.swarm.lock().await;
-
-        swarm.behaviour_mut().gossipsub.subscribe(&self.topic)?;
-
-        swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+        let p2p = self.p2p.lock().await;
+        let p2p_call_tx = p2p.call_tx.clone();
+        let mut p2p_event_rx = p2p.event_tx.subscribe();
+        drop(p2p);
+        let self_ = self.clone();
+        task::spawn(async move {
+            let mut p2p = self_.p2p.lock().await;
+            p2p.run().await.unwrap();
+        });
 
         self.event_tx.send(NodeEvent::Ready).unwrap();
 
@@ -603,55 +557,28 @@ impl Node {
                     }
                 }
                 Ok(message) = self.publish_rx.recv_async() => {
-                    let encoded_message =
-                        bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
-                    swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(self.topic.clone(), encoded_message)
-                        .unwrap();
+                    p2p_call_tx.send(P2pCall::Publish(message)).unwrap();
                 }
-                event = swarm.select_next_some() => match event {
-                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                        for (peer_id, _multiaddr) in list {
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                Ok(p2p_event) = p2p_event_rx.recv() => {
+                    match p2p_event {
+                        P2pEvent::Discovered(peer_id) => {
                             self.event_tx.send(NodeEvent::Discovered(peer_id)).unwrap();
                         }
-                    },
-                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                        for (peer_id, _multiaddr) in list {
-                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        P2pEvent::Subscribed => {
+                            self.event_tx.send(NodeEvent::Subscribed).unwrap();
                         }
-                    },
-                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { .. })) => {
-                        self.event_tx.send(NodeEvent::Subscribed).unwrap();
-                    },
-                    SwarmEvent::Behaviour(SwarmBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                        message,
-                        ..
-                    })) => {
-                        let peer_id = message.source.unwrap();
-                        let message: Message = bincode::serde::decode_from_slice(&message.data, bincode::config::standard()).unwrap().0;
-                        let mut state = self.state.lock().await;
-                        state.message_log.push(message.clone());
-                        drop(state);
-                        if message.sender != self.keypair.public().to_peer_id() {
-                            println!("{}: received message from {} ({}): {:?}", self.id, message.sender, peer_id, message.content);
+                        P2pEvent::Received(message) => {
+                            let mut state = self.state.lock().await;
+                            state.message_log.push(message.clone());
+                            drop(state);
+                            self.handle_message(message).await;
+                            sleep(Duration::from_millis(0)).await;
                         }
-                        self.handle_message(message).await;
-                        sleep(Duration::from_millis(0)).await;
-                    },
-                    _ => {}
-                },
+                    }
+                }
             }
         }
     }
-}
-
-#[derive(NetworkBehaviour)]
-struct SwarmBehaviour {
-    gossipsub: gossipsub::Behaviour,
-    mdns: mdns::tokio::Behaviour,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
