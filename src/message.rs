@@ -17,6 +17,16 @@ pub struct Message {
     pub content: MessageContent,
 }
 
+impl Message {
+    pub fn from_slice(slice: &[u8]) -> Result<Self, bincode::error::DecodeError> {
+        bincode::serde::decode_from_slice(slice, bincode::config::standard()).map(|x| x.0)
+    }
+
+    pub fn to_vec(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageContent {
     Proposal {
@@ -74,10 +84,8 @@ mod tests {
             },
         };
 
-        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
-        let decoded = bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
-            .unwrap()
-            .0;
+        let encoded = message.to_vec().unwrap();
+        let decoded = Message::from_slice(&encoded).unwrap();
 
         assert_eq!(message, decoded);
     }

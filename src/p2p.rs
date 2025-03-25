@@ -88,8 +88,6 @@ impl P2p {
                 Ok(call) = self.call_rx.recv_async() => {
                     match call {
                         P2pCall::Publish(message) => {
-                            let encoded_message =
-                            bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
                             let encoded_message = message.to_vec().unwrap();
                             swarm
                                 .behaviour_mut()
@@ -121,7 +119,7 @@ impl P2p {
                         message,
                         ..
                     })) => {
-                        let message: Message = bincode::serde::decode_from_slice(&message.data, bincode::config::standard()).unwrap().0;
+                        let message = Message::from_slice(&message.data).unwrap();
                         self.event_tx.send(P2pEvent::Received(message)).unwrap();
                         // sleep(Duration::from_millis(0)).await;
                     },
