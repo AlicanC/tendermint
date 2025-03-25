@@ -540,8 +540,6 @@ impl Node {
             p2p.run().await.unwrap();
         });
 
-        self.event_tx.send(NodeEvent::Ready).unwrap();
-
         loop {
             select! {
                 Ok(call) = self.call_rx.recv_async() => {
@@ -583,7 +581,6 @@ impl Node {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeEvent {
-    Ready,
     Discovered(PeerId),
     Subscribed,
     StartingRound(Height, u64),
