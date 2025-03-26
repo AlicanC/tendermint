@@ -197,9 +197,22 @@ async fn consensus() -> Result<(), Box<dyn Error>> {
     charlie_handle.await?;
 
     // Assert heights
-    assert_eq!(alice_node.state.lock().await.height, 3);
-    assert_eq!(bob_node.state.lock().await.height, 3);
-    assert_eq!(charlie_node.state.lock().await.height, 2);
+    assert_eq!(
+        alice_node.consensus.lock().await.state.lock().await.height,
+        3
+    );
+    assert_eq!(bob_node.consensus.lock().await.state.lock().await.height, 3);
+    assert_eq!(
+        charlie_node
+            .consensus
+            .lock()
+            .await
+            .state
+            .lock()
+            .await
+            .height,
+        2
+    );
 
     Ok(())
 }

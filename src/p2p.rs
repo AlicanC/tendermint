@@ -121,7 +121,6 @@ impl P2p {
                     })) => {
                         let message = Message::from_slice(&message.data).unwrap();
                         self.event_tx.send(P2pEvent::Received(message)).unwrap();
-                        // sleep(Duration::from_millis(0)).await;
                     },
                     _ => {}
                 },
