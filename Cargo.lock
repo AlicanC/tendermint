@@ -2846,6 +2846,8 @@ dependencies = [
  "libp2p",
  "serde",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

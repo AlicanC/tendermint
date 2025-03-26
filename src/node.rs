@@ -138,9 +138,11 @@ impl Node {
 
     async fn start_round(self: &Arc<Self>, round: u64) {
         let mut state = self.state.lock().await;
-        println!(
+        tracing::info!(
             "{}: starting round {} at height {}",
-            self.id, round, state.height,
+            self.id,
+            round,
+            state.height,
         );
         self.event_tx
             .send(NodeEvent::StartingRound(state.height, state.round))
@@ -177,7 +179,7 @@ impl Node {
     async fn on_timeout_propose(self: Arc<Self>, height: u64, round: u64) {
         let mut state = self.state.lock().await;
         if height == state.height && round == state.round && state.step == Step::Propose {
-            println!("{}: timeout propose", self.id);
+            tracing::info!("{}: timeout propose", self.id);
             self.broadcast(MessageContent::Prevote {
                 height,
                 round,
@@ -191,7 +193,7 @@ impl Node {
     async fn on_timeout_prevote(self: Arc<Self>, height: u64, round: u64) {
         let mut state = self.state.lock().await;
         if height == state.height && round == state.round && state.step == Step::Prevote {
-            println!("{}: timeout prevote", self.id);
+            tracing::info!("{}: timeout prevote", self.id);
             self.broadcast(MessageContent::Precommit {
                 height,
                 round,
@@ -205,7 +207,7 @@ impl Node {
     async fn on_timeout_precommit(self: &Arc<Self>, height: u64, round: u64) {
         let state = self.state.lock().await;
         if height == state.height && round == state.round {
-            println!("{}: timeout precommit", self.id);
+            tracing::info!("{}: timeout precommit", self.id);
             drop(state);
             self.start_round(round + 1).await;
         }
@@ -216,7 +218,7 @@ impl Node {
             sender: self.keypair.public().to_peer_id(),
             content: message_content,
         };
-        println!("{}: broadcasting: {:?}", self.id, message.content);
+        tracing::info!("{}: broadcasting: {:?}", self.id, message.content);
         self.publish_tx.send(message.clone()).unwrap();
         let mut state = self.state.lock().await;
         state.message_log.push(message);
@@ -246,7 +248,7 @@ impl Node {
                 }
                 _ => false,
             }) {
-                println!("{}: handling 22...", self.id);
+                tracing::info!("{}: handling 22...", self.id);
                 if self.valid(proposal)
                     && (state.locked_round.is_none()
                         || state.locked_value == Some(proposal.clone()))
@@ -295,7 +297,7 @@ impl Node {
                 }
                 _ => false,
             }) {
-                println!("{}: handling 28...", self.id);
+                tracing::info!("{}: handling 28...", self.id);
                 if self.valid(proposal)
                     && ((state.locked_round.is_none()
                         || state.locked_round.unwrap() < *valid_round)
@@ -330,7 +332,7 @@ impl Node {
                 .sum::<u64>()
                 > 2 * f + 1
             {
-                println!("{}: handling 34 prevote...", self.id);
+                tracing::info!("{}: handling 34 prevote...", self.id);
                 let height = state.height;
                 let round = state.round;
                 let duration = self.timeout_prevote(round);
@@ -376,7 +378,7 @@ impl Node {
                     > 2 * f + 1
                     && self.valid(proposal)
                 {
-                    println!("{}: handling 36 proposal...", self.id);
+                    tracing::info!("{}: handling 36 proposal...", self.id);
                     let height = state.height;
                     let round = state.round;
                     if state.step == Step::Prevote {
@@ -418,7 +420,7 @@ impl Node {
                 .sum::<u64>()
                 > 2 * f + 1
             {
-                println!("{}: handling 44...", self.id);
+                tracing::info!("{}: handling 44...", self.id);
                 let height = state.height;
                 let round = state.round;
                 self.broadcast(MessageContent::Precommit {
@@ -442,7 +444,7 @@ impl Node {
                 .sum::<u64>()
                 > 2 * f + 1
             {
-                println!("{}: handling 47 precommit...", self.id);
+                tracing::info!("{}: handling 47 precommit...", self.id);
                 let height = state.height;
                 let round = state.round;
                 let duration = self.timeout_precommit(round);
@@ -489,7 +491,7 @@ impl Node {
                         .sum::<u64>()
                         > 2 * f + 1
                     {
-                        println!("{}: handling 49...", self.id);
+                        tracing::info!("{}: handling 49...", self.id);
                         if self.valid(proposal) {
                             let height = state.height;
                             let mut state = self.state.lock().await;
@@ -522,13 +524,13 @@ impl Node {
                 > f + 1
             && message.content.round() > state.round
         {
-            println!("{}: handling 55...", self.id);
+            tracing::info!("{}: handling 55...", self.id);
             self.start_round(message.content.round()).await;
         }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<(), Box<dyn Error>> {
-        println!("{}: running...", self.id);
+        tracing::info!("{}: running...", self.id);
 
         let p2p = self.p2p.lock().await;
         let p2p_call_tx = p2p.call_tx.clone();
@@ -545,11 +547,11 @@ impl Node {
                 Ok(call) = self.call_rx.recv_async() => {
                     match call {
                         NodeCall::Start => {
-                            println!("{}: starting...", self.id);
+                            tracing::info!("{}: starting...", self.id);
                             self.start_round(0).await;
                         }
                         NodeCall::Stop => {
-                            println!("{}: stopping...", self.id);
+                            tracing::info!("{}: stopping...", self.id);
                             break Ok(());
                         }
                     }

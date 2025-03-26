@@ -32,6 +32,15 @@ impl TestActor {
 #[tokio::test]
 async fn consensus() -> Result<(), Box<dyn Error>> {
     // Setup
+    let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive("tendermint=info".parse()?)
+                .from_env_lossy(),
+        )
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+
     let alice = TestActor::new("Alice  ")?;
     let bob = TestActor::new("Bob    ")?;
     let charlie = TestActor::new("Charlie")?;
