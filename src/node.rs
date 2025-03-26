@@ -229,6 +229,8 @@ impl Node {
 
         let state = self.state.lock().await.clone();
 
+        // See: https://arxiv.org/pdf/1807.04938#page=6
+
         // 22: upon {PROPOSAL, h_p, round_p, v, −1} from proposer(h_p, round_p) while step_p = propose do
         if state.step == Step::Propose {
             if let Some(Message {
