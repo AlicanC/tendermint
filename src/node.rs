@@ -1,7 +1,7 @@
 #![allow(clippy::match_like_matches_macro)]
 #![allow(clippy::collapsible_if)]
 
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{error::Error, sync::Arc};
 
 use flume::SendError;
 use libp2p::{PeerId, identity::Keypair};
@@ -9,7 +9,6 @@ use tokio::{
     select,
     sync::broadcast,
     task::{self, JoinHandle},
-    time::sleep,
 };
 
 use crate::{
@@ -110,11 +109,11 @@ impl Node {
                             }
                             P2pEvent::Received(message) => {
                                 consensus.call(ConsensusCall::Handle(message)).unwrap();
-                                sleep(Duration::from_millis(0)).await;
                             }
                         }
                     }
                 }
+                task::yield_now().await;
             }
         }))
     }

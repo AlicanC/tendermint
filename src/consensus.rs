@@ -565,6 +565,7 @@ impl Consensus {
                         self_.event_tx.send(ConsensusEvent::Broadcast(message)).unwrap();
                     }
                 }
+                task::yield_now().await;
             }
         }))
     }

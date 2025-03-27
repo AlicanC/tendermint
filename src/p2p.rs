@@ -148,6 +148,7 @@ impl P2p {
                         _ => {}
                     },
                 }
+                task::yield_now().await;
             }
         }))
     }
