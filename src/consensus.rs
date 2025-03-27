@@ -3,11 +3,12 @@
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
+use flume::SendError;
 use libp2p::{PeerId, identity::Keypair};
 use tokio::{
     select,
     sync::{Mutex, broadcast},
-    task,
+    task::{self, JoinHandle},
     time::{self},
 };
 
@@ -105,6 +106,14 @@ impl Consensus {
         })
     }
 
+    pub fn call(&self, call: ConsensusCall) -> Result<(), SendError<ConsensusCall>> {
+        self.call_tx.send(call)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<ConsensusEvent> {
+        self.event_tx.subscribe()
+    }
+
     fn proposer(&self, height: u64, round: u64) -> PeerId {
         self.validator_set.items
             [(height as usize + round as usize) % self.validator_set.items.len()]
@@ -171,7 +180,7 @@ impl Consensus {
         }
     }
 
-    async fn on_timeout_propose(self: Arc<Self>, height: u64, round: u64) {
+    async fn on_timeout_propose(self: &Arc<Self>, height: u64, round: u64) {
         let mut state = self.state.lock().await;
         if height == state.height && round == state.round && state.step == ConsensusStep::Propose {
             tracing::info!("{}: timeout propose", self.id);
@@ -185,7 +194,7 @@ impl Consensus {
         }
     }
 
-    async fn on_timeout_prevote(self: Arc<Self>, height: u64, round: u64) {
+    async fn on_timeout_prevote(self: &Arc<Self>, height: u64, round: u64) {
         let mut state = self.state.lock().await;
         if height == state.height && round == state.round && state.step == ConsensusStep::Prevote {
             tracing::info!("{}: timeout prevote", self.id);
@@ -527,34 +536,37 @@ impl Consensus {
         }
     }
 
-    pub async fn run(self: &Arc<Self>) -> Result<(), Box<dyn Error>> {
+    pub async fn run(self: &Arc<Self>) -> Result<JoinHandle<()>, Box<dyn Error>> {
         tracing::info!("{}: running...", self.id);
 
-        loop {
-            select! {
-                Ok(call) = self.call_rx.recv_async() => {
-                    match call {
-                        ConsensusCall::Start => {
-                            tracing::info!("{}: starting...", self.id);
-                            self.start_round(0).await;
-                        }
-                        ConsensusCall::Handle(message) => {
-                            let mut state = self.state.lock().await;
-                            state.message_log.push(message.clone());
-                            drop(state);
-                            self.handle_message(message).await;
-                        }
-                        ConsensusCall::Stop => {
-                            tracing::info!("{}: stopping...", self.id);
-                            break Ok(());
+        let self_ = self.clone();
+        Ok(task::spawn(async move {
+            loop {
+                select! {
+                    Ok(call) = self_.call_rx.recv_async() => {
+                        match call {
+                            ConsensusCall::Start => {
+                                tracing::info!("{}: starting...", self_.id);
+                                self_.start_round(0).await;
+                            }
+                            ConsensusCall::Handle(message) => {
+                                let mut state = self_.state.lock().await;
+                                state.message_log.push(message.clone());
+                                drop(state);
+                                self_.handle_message(message).await;
+                            }
+                            ConsensusCall::Stop => {
+                                tracing::info!("{}: stopping...", self_.id);
+                                break;
+                            }
                         }
                     }
-                }
-                Ok(message) = self.publish_rx.recv_async() => {
-                    self.event_tx.send(ConsensusEvent::Broadcast(message)).unwrap();
+                    Ok(message) = self_.publish_rx.recv_async() => {
+                        self_.event_tx.send(ConsensusEvent::Broadcast(message)).unwrap();
+                    }
                 }
             }
-        }
+        }))
     }
 }
 

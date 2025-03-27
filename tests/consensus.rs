@@ -1,4 +1,4 @@
-use std::{error::Error, sync::Arc};
+use std::error::Error;
 
 use libp2p::{PeerId, identity::Keypair};
 use tendermint::{
@@ -54,46 +54,19 @@ async fn consensus() -> Result<(), Box<dyn Error>> {
     };
 
     // Create nodes
-    let alice_node = Arc::new(Node::new(
-        alice.id.clone(),
-        alice.keypair.clone(),
-        genesis.clone(),
-    )?);
-    let bob_node = Arc::new(Node::new(
-        bob.id.clone(),
-        bob.keypair.clone(),
-        genesis.clone(),
-    )?);
-    let charlie_node = Arc::new(Node::new(
-        charlie.id.clone(),
-        charlie.keypair.clone(),
-        genesis.clone(),
-    )?);
-
-    let alice_call_tx = alice_node.call_tx.clone();
-    let bob_call_tx = bob_node.call_tx.clone();
-    let charlie_call_tx = charlie_node.call_tx.clone();
-    let mut alice_event_rx = alice_node.event_tx.subscribe();
-    let mut bob_event_rx = bob_node.event_tx.subscribe();
-    let mut charlie_event_rx = charlie_node.event_tx.subscribe();
+    let alice_node = Node::new(alice.id.clone(), alice.keypair.clone(), genesis.clone())?;
+    let bob_node = Node::new(bob.id.clone(), bob.keypair.clone(), genesis.clone())?;
+    let charlie_node = Node::new(charlie.id.clone(), charlie.keypair.clone(), genesis.clone())?;
 
     // Run nodes
-    let alice_handle = {
-        let alice_node = alice_node.clone();
-        task::spawn(async move { alice_node.run().await.unwrap() })
-    };
-    let bob_handle = {
-        let bob_node = bob_node.clone();
-        task::spawn(async move { bob_node.run().await.unwrap() })
-    };
-    let charlie_handle = {
-        let charlie_node = charlie_node.clone();
-        task::spawn(async move { charlie_node.run().await.unwrap() })
-    };
+    let alice_handle = alice_node.run().await?;
+    let bob_handle = bob_node.run().await?;
+    let charlie_handle = charlie_node.run().await?;
 
     // Wait for nodes to be ready
     println!("Waiting for nodes to discover each other...");
     let alice_ready_handle = {
+        let mut alice_event_rx = alice_node.subscribe();
         let bob = bob.clone();
         let charlie = charlie.clone();
         task::spawn(async move {
@@ -117,6 +90,7 @@ async fn consensus() -> Result<(), Box<dyn Error>> {
         })
     };
     let bob_ready_handle = {
+        let mut bob_event_rx = bob_node.subscribe();
         let alice = alice.clone();
         let charlie = charlie.clone();
         task::spawn(async move {
@@ -140,6 +114,7 @@ async fn consensus() -> Result<(), Box<dyn Error>> {
         })
     };
     let charlie_ready_handle = {
+        let mut charlie_event_rx = charlie_node.subscribe();
         let alice = alice.clone();
         let bob = bob.clone();
         task::spawn(async move {
@@ -169,13 +144,13 @@ async fn consensus() -> Result<(), Box<dyn Error>> {
 
     // Send start calls
     println!("Sending start calls...");
-    alice_call_tx.send_async(NodeCall::Start).await?;
-    bob_call_tx.send_async(NodeCall::Start).await?;
-    charlie_call_tx.send_async(NodeCall::Start).await?;
+    alice_node.call(NodeCall::Start).unwrap();
+    bob_node.call(NodeCall::Start).unwrap();
+    charlie_node.call(NodeCall::Start).unwrap();
 
     // Wait for Alice to start a round at height 3
     println!("Waiting for Alice to start a round at height 3...");
-    let mut alice_event_rx = alice_node.event_tx.subscribe();
+    let mut alice_event_rx = alice_node.subscribe();
     while let Ok(event) = alice_event_rx.recv().await {
         if let NodeEvent::StartingRound(height, ..) = event {
             if height == 3 {
@@ -186,9 +161,9 @@ async fn consensus() -> Result<(), Box<dyn Error>> {
 
     // Send stop calls
     println!("Sending stop calls...");
-    alice_call_tx.send_async(NodeCall::Stop).await?;
-    bob_call_tx.send_async(NodeCall::Stop).await?;
-    charlie_call_tx.send_async(NodeCall::Stop).await?;
+    alice_node.call(NodeCall::Stop).unwrap();
+    bob_node.call(NodeCall::Stop).unwrap();
+    charlie_node.call(NodeCall::Stop).unwrap();
 
     // Wait for nodes to finish
     println!("Waiting for nodes to finish...");
@@ -197,22 +172,9 @@ async fn consensus() -> Result<(), Box<dyn Error>> {
     charlie_handle.await?;
 
     // Assert heights
-    assert_eq!(
-        alice_node.consensus.lock().await.state.lock().await.height,
-        3
-    );
-    assert_eq!(bob_node.consensus.lock().await.state.lock().await.height, 3);
-    assert_eq!(
-        charlie_node
-            .consensus
-            .lock()
-            .await
-            .state
-            .lock()
-            .await
-            .height,
-        2
-    );
+    assert_eq!(alice_node.consensus.state.lock().await.height, 3);
+    assert_eq!(bob_node.consensus.state.lock().await.height, 3);
+    assert_eq!(charlie_node.consensus.state.lock().await.height, 3);
 
     Ok(())
 }

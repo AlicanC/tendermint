@@ -3,11 +3,12 @@
 
 use std::{error::Error, sync::Arc, time::Duration};
 
+use flume::SendError;
 use libp2p::{PeerId, identity::Keypair};
 use tokio::{
     select,
-    sync::{Mutex, broadcast},
-    task,
+    sync::broadcast,
+    task::{self, JoinHandle},
     time::sleep,
 };
 
@@ -20,13 +21,14 @@ use crate::{
 pub struct Node {
     id: NodeId,
 
-    pub call_tx: flume::Sender<NodeCall>,
+    call_tx: flume::Sender<NodeCall>,
     call_rx: flume::Receiver<NodeCall>,
-    pub event_tx: broadcast::Sender<NodeEvent>,
-    pub event_rx: broadcast::Receiver<NodeEvent>,
+    event_tx: broadcast::Sender<NodeEvent>,
+    #[allow(dead_code)]
+    event_rx: broadcast::Receiver<NodeEvent>,
 
-    p2p: Mutex<P2p>,
-    pub consensus: Mutex<Arc<Consensus>>,
+    p2p: Arc<P2p>,
+    pub consensus: Arc<Consensus>,
 }
 
 impl Node {
@@ -43,76 +45,78 @@ impl Node {
             call_rx,
             event_tx,
             event_rx,
-            p2p: Mutex::new(p2p),
-            consensus: Mutex::new(Arc::new(consensus)),
+            p2p: Arc::new(p2p),
+            consensus: Arc::new(consensus),
         })
     }
 
-    pub async fn run(self: Arc<Self>) -> Result<(), Box<dyn Error>> {
+    pub fn call(&self, call: NodeCall) -> Result<(), SendError<NodeCall>> {
+        self.call_tx.send(call)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
+        self.event_tx.subscribe()
+    }
+
+    pub async fn run(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
         tracing::info!("{}: running...", self.id);
 
-        let p2p = self.p2p.lock().await;
-        let p2p_call_tx = p2p.call_tx.clone();
-        let mut p2p_event_rx = p2p.event_tx.subscribe();
-        drop(p2p);
-        let self_ = self.clone();
-        task::spawn(async move {
-            let mut p2p = self_.p2p.lock().await;
-            p2p.run().await.unwrap();
-        });
+        self.p2p.run().await?;
+        self.consensus.run().await?;
 
-        let consensus = self.consensus.lock().await;
-        let consensus_call_tx = consensus.call_tx.clone();
-        let mut consensus_event_rx = consensus.event_tx.subscribe();
-        drop(consensus);
-        let self_ = self.clone();
-        task::spawn(async move {
-            let consensus = self_.consensus.lock().await;
-            consensus.run().await.unwrap();
-        });
+        let id = self.id.clone();
+        let call_rx = self.call_rx.clone();
+        let event_tx = self.event_tx.clone();
+        let p2p = self.p2p.clone();
+        let consensus = self.consensus.clone();
 
-        loop {
-            select! {
-                Ok(call) = self.call_rx.recv_async() => {
-                    match call {
-                        NodeCall::Start => {
-                            tracing::info!("{}: starting...", self.id);
-                            consensus_call_tx.send(ConsensusCall::Start).unwrap();
-                        }
-                        NodeCall::Stop => {
-                            tracing::info!("{}: stopping...", self.id);
-                            p2p_call_tx.send(P2pCall::Stop).unwrap();
-                            consensus_call_tx.send(ConsensusCall::Stop).unwrap();
-                            break Ok(());
+        Ok(task::spawn(async move {
+            let mut p2p_event_rx = p2p.subscribe();
+            let mut consensus_event_rx = consensus.subscribe();
+
+            loop {
+                select! {
+                    Ok(call) = call_rx.recv_async() => {
+                        match call {
+                            NodeCall::Start => {
+                                tracing::info!("{}: starting...", id);
+                                consensus.call(ConsensusCall::Start).unwrap();
+                            }
+                            NodeCall::Stop => {
+                                tracing::info!("{}: stopping...", id);
+                                p2p.call(P2pCall::Stop).unwrap();
+                                consensus.call(ConsensusCall::Stop).unwrap();
+                                break;
+                            }
                         }
                     }
-                }
-                Ok(consensus_event) = consensus_event_rx.recv() => {
-                    match consensus_event {
-                        ConsensusEvent::Broadcast(message) => {
-                            p2p_call_tx.send(P2pCall::Publish(message)).unwrap();
-                        }
-                        ConsensusEvent::StartingRound(height, round) => {
-                            self.event_tx.send(NodeEvent::StartingRound(height, round)).unwrap();
+                    Ok(consensus_event) = consensus_event_rx.recv() => {
+                        match consensus_event {
+                            ConsensusEvent::Broadcast(message) => {
+                                p2p.call(P2pCall::Publish(message)).unwrap();
+                            }
+                            ConsensusEvent::StartingRound(height, round) => {
+                                event_tx.send(NodeEvent::StartingRound(height, round)).unwrap();
+                            }
                         }
                     }
-                }
-                Ok(p2p_event) = p2p_event_rx.recv() => {
-                    match p2p_event {
-                        P2pEvent::Discovered(peer_id) => {
-                            self.event_tx.send(NodeEvent::Discovered(peer_id)).unwrap();
-                        }
-                        P2pEvent::Subscribed => {
-                            self.event_tx.send(NodeEvent::Subscribed).unwrap();
-                        }
-                        P2pEvent::Received(message) => {
-                            consensus_call_tx.send(ConsensusCall::Handle(message)).unwrap();
-                            sleep(Duration::from_millis(0)).await;
+                    Ok(p2p_event) = p2p_event_rx.recv() => {
+                        match p2p_event {
+                            P2pEvent::Discovered(peer_id) => {
+                                event_tx.send(NodeEvent::Discovered(peer_id)).unwrap();
+                            }
+                            P2pEvent::Subscribed => {
+                                event_tx.send(NodeEvent::Subscribed).unwrap();
+                            }
+                            P2pEvent::Received(message) => {
+                                consensus.call(ConsensusCall::Handle(message)).unwrap();
+                                sleep(Duration::from_millis(0)).await;
+                            }
                         }
                     }
                 }
             }
-        }
+        }))
     }
 }
 

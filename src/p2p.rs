@@ -1,9 +1,11 @@
 use std::{
     error::Error,
     hash::{DefaultHasher, Hash, Hasher},
+    sync::Arc,
     time::Duration,
 };
 
+use flume::SendError;
 use libp2p::{
     PeerId, Swarm, SwarmBuilder,
     futures::StreamExt,
@@ -13,16 +15,22 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
-use tokio::{io, select, sync::broadcast};
+use tokio::{
+    io, select,
+    sync::{Mutex, broadcast},
+    task::{self, JoinHandle},
+};
 
 use crate::message::Message;
 
 pub struct P2p {
-    swarm: Swarm<P2pSwarmBehaviour>,
-    pub call_tx: flume::Sender<P2pCall>,
+    call_tx: flume::Sender<P2pCall>,
     call_rx: flume::Receiver<P2pCall>,
-    pub event_tx: broadcast::Sender<P2pEvent>,
-    pub event_rx: broadcast::Receiver<P2pEvent>,
+    event_tx: broadcast::Sender<P2pEvent>,
+    #[allow(dead_code)]
+    event_rx: broadcast::Receiver<P2pEvent>,
+
+    swarm: Arc<Mutex<Swarm<P2pSwarmBehaviour>>>,
 }
 
 impl P2p {
@@ -70,12 +78,20 @@ impl P2p {
             call_rx,
             event_tx,
             event_rx,
-            swarm,
+            swarm: Arc::new(Mutex::new(swarm)),
         })
     }
 
-    pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
-        let swarm = &mut self.swarm;
+    pub fn call(&self, call: P2pCall) -> Result<(), SendError<P2pCall>> {
+        self.call_tx.send(call)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<P2pEvent> {
+        self.event_tx.subscribe()
+    }
+
+    pub async fn run(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
+        let mut swarm = self.swarm.lock().await;
 
         let topic = gossipsub::IdentTopic::new("consensus");
         swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -83,49 +99,57 @@ impl P2p {
         swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
-        loop {
-            select! {
-                Ok(call) = self.call_rx.recv_async() => {
-                    match call {
-                        P2pCall::Publish(message) => {
-                            let encoded_message = message.to_vec().unwrap();
-                            swarm
-                                .behaviour_mut()
-                                .gossipsub
-                                .publish(topic.clone(), encoded_message)
-                                .unwrap();
-                        }
-                        P2pCall::Stop => {
-                            break Ok(());
+        let call_rx = self.call_rx.clone();
+        let event_tx = self.event_tx.clone();
+        let swarm = self.swarm.clone();
+
+        Ok(task::spawn(async move {
+            let mut swarm = swarm.lock().await;
+
+            loop {
+                select! {
+                    Ok(call) = call_rx.recv_async() => {
+                        match call {
+                            P2pCall::Publish(message) => {
+                                let encoded_message = message.to_vec().unwrap();
+                                swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .publish(topic.clone(), encoded_message)
+                                    .unwrap();
+                            }
+                            P2pCall::Stop => {
+                                break;
+                            }
                         }
                     }
+                    event = swarm.select_next_some() => match event {
+                        SwarmEvent::Behaviour(P2pSwarmBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                            for (peer_id, _multiaddr) in list {
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                event_tx.send(P2pEvent::Discovered(peer_id)).unwrap();
+                            }
+                        },
+                        SwarmEvent::Behaviour(P2pSwarmBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                            for (peer_id, _multiaddr) in list {
+                                swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                            }
+                        },
+                        SwarmEvent::Behaviour(P2pSwarmBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { .. })) => {
+                            event_tx.send(P2pEvent::Subscribed).unwrap();
+                        },
+                        SwarmEvent::Behaviour(P2pSwarmBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                            message,
+                            ..
+                        })) => {
+                            let message = Message::from_slice(&message.data).unwrap();
+                            event_tx.send(P2pEvent::Received(message)).unwrap();
+                        },
+                        _ => {}
+                    },
                 }
-                event = swarm.select_next_some() => match event {
-                    SwarmEvent::Behaviour(P2pSwarmBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                        for (peer_id, _multiaddr) in list {
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                            self.event_tx.send(P2pEvent::Discovered(peer_id)).unwrap();
-                        }
-                    },
-                    SwarmEvent::Behaviour(P2pSwarmBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                        for (peer_id, _multiaddr) in list {
-                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                        }
-                    },
-                    SwarmEvent::Behaviour(P2pSwarmBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { .. })) => {
-                        self.event_tx.send(P2pEvent::Subscribed).unwrap();
-                    },
-                    SwarmEvent::Behaviour(P2pSwarmBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                        message,
-                        ..
-                    })) => {
-                        let message = Message::from_slice(&message.data).unwrap();
-                        self.event_tx.send(P2pEvent::Received(message)).unwrap();
-                    },
-                    _ => {}
-                },
             }
-        }
+        }))
     }
 }
 
