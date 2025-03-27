@@ -68,10 +68,11 @@ pub struct Consensus {
     keypair: Keypair,
     validator_set: ValidatorSet,
 
-    pub call_tx: flume::Sender<ConsensusCall>,
+    call_tx: flume::Sender<ConsensusCall>,
     call_rx: flume::Receiver<ConsensusCall>,
-    pub event_tx: broadcast::Sender<ConsensusEvent>,
-    pub event_rx: broadcast::Receiver<ConsensusEvent>,
+    event_tx: broadcast::Sender<ConsensusEvent>,
+    #[allow(dead_code)]
+    event_rx: broadcast::Receiver<ConsensusEvent>,
     publish_tx: flume::Sender<Message>,
     publish_rx: flume::Receiver<Message>,
 
